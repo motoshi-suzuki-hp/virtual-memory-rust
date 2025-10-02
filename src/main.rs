@@ -4,36 +4,37 @@
 
 use core::panic::PanicInfo;
 use wasabi::{println, info, error};
-use wasabi::uefi::{EfiHandle, EfiSystemTable, EfiMemoryType, MemoryMapHolder, exit_from_efi_boot_services};
+use wasabi::graphics::{fill_rect, draw_test_pattern, Bitmap};
+use wasabi::uefi::{init_vram, EfiHandle, EfiSystemTable, MemoryMapHolder, exit_from_efi_boot_services};
+use wasabi::qemu::{exit_qemu, QemuExitCode};
 
 #[no_mangle]
 fn efi_main(image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
     println!("Booting WasabiOS...");
-    println!("image_handle: {:#018X}", image_handle);
-    println!("efi_system_table: {:#p}", efi_system_table);
 
-    // メモリマップを取得
+    // グラフィックスを初期化
+    let mut vram = init_vram(efi_system_table).expect("Failed to init vram");
+    let vw = vram.width();
+    let vh = vram.height();
+    info!("VRAM initialized: {}x{}", vw, vh);
+
+    // 画面を黒でクリア
+    let _ = fill_rect(&mut vram, 0x000000, 0, 0, vw, vh);
+
+    // テストパターンを描画
+    draw_test_pattern(&mut vram);
+
+    info!("Graphics initialized");
+
+    // メモリマップ取得とブートサービス終了
     let mut memory_map = MemoryMapHolder::new();
     exit_from_efi_boot_services(image_handle, efi_system_table, &mut memory_map);
-
-    info!("Exited from UEFI Boot Services");
-
-    // メモリマップを表示
-    let mut total_pages = 0;
-    for e in memory_map.iter() {
-        if e.memory_type() == EfiMemoryType::CONVENTIONAL_MEMORY {
-            total_pages += e.number_of_pages();
-        }
-    }
-
-    let total_mb = total_pages * 4096 / 1024 / 1024;
-    info!("Total memory: {} MB", total_mb);
 
     loop {}
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    error!("PANIC: {:?}", info);
-    loop {}
+    error!("PANIC: {info:?}");
+    exit_qemu(QemuExitCode::Fail);
 }

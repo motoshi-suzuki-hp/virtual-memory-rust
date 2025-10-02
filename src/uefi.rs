@@ -1,3 +1,8 @@
+use core::ptr::null_mut;
+use crate::graphics::draw_font_fg;
+use crate::result::Result;
+use core::fmt;
+
 type EfiVoid = u8;
 
 pub type EfiHandle = u64;
@@ -75,9 +80,6 @@ impl EfiSystemTable {
         self.boot_services
     }
 }
-
-// EFI Boot Services Table
-type EfiVoid = u8;
 
 #[repr(C)]
 pub struct EfiBootServicesTable {
@@ -180,4 +182,160 @@ pub fn exit_from_efi_boot_services(
             break;
         }
     }
+}
+
+const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data0: 0x9042a9de,
+    data1: 0x23dc,
+    data2: 0x4a38,
+    data3: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+};
+
+#[repr(C)]
+struct EfiGraphicsOutputProtocolPixelInfo {
+    version: u32,
+    pub horizontal_resolution: u32,
+    pub vertical_resolution: u32,
+    _padding0: [u32; 5],
+    pub pixels_per_scan_line: u32,
+}
+
+#[repr(C)]
+struct EfiGraphicsOutputProtocolMode<'a> {
+    pub max_mode: u32,
+    pub mode: u32,
+    pub info: &'a EfiGraphicsOutputProtocolPixelInfo,
+    pub size_of_info: u64,
+    pub frame_buffer_base: usize,
+    pub frame_buffer_size: usize,
+}
+
+#[repr(C)]
+struct EfiGraphicsOutputProtocol<'a> {
+    _reserved: [u64; 3],
+    pub mode: &'a EfiGraphicsOutputProtocolMode<'a>,
+}
+
+// locate_protocol関数をEfiBootServicesTableに追加
+impl EfiBootServicesTable {
+    fn locate_protocol(
+        &self,
+        protocol: &EfiGuid,
+    ) -> Result<*mut u8> {
+        let locate_protocol: extern "win64" fn(
+            protocol: *const EfiGuid,
+            registration: *const u8,
+            interface: *mut *mut u8,
+        ) -> EfiStatus = unsafe {
+            core::mem::transmute(
+                *(self as *const _ as *const usize).offset(40)
+            )
+        };
+
+        let mut interface = null_mut::<u8>();
+        let status = locate_protocol(
+            protocol,
+            null_mut(),
+            &mut interface,
+        );
+
+        if status != EfiStatus::Success {
+            Err("Failed to locate protocol")
+        } else {
+            Ok(interface)
+        }
+    }
+}
+
+pub fn init_vram(efi_system_table: &EfiSystemTable) -> Result<VramBufferInfo> {
+    let gp_ptr = efi_system_table
+        .boot_services()
+        .locate_protocol(&EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID)?;
+
+    let gp = unsafe { &*(gp_ptr as *const EfiGraphicsOutputProtocol) };
+
+    Ok(VramBufferInfo {
+        buf: gp.mode.frame_buffer_base as *mut u8,
+        width: gp.mode.info.horizontal_resolution as i64,
+        height: gp.mode.info.vertical_resolution as i64,
+        pixels_per_line: gp.mode.info.pixels_per_scan_line as i64,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub struct VramBufferInfo {
+    buf: *mut u8,
+    width: i64,
+    height: i64,
+    pixels_per_line: i64,
+}
+
+impl crate::graphics::Bitmap for VramBufferInfo {
+    fn bytes_per_pixel(&self) -> i64 { 4 }
+    fn pixels_per_line(&self) -> i64 { self.pixels_per_line }
+    fn width(&self) -> i64 { self.width }
+    fn height(&self) -> i64 { self.height }
+    fn buf_mut(&mut self) -> *mut u8 { self.buf }
+}
+
+// VRAM上にテキストを書き込むライター
+pub struct VramTextWriter<'a> {
+    vram: &'a mut VramBufferInfo,
+    cursor_x: i64,
+    cursor_y: i64,
+}
+
+impl<'a> VramTextWriter<'a> {
+    pub fn new(vram: &'a mut VramBufferInfo) -> Self {
+        Self {
+            vram,
+            cursor_x: 0,
+            cursor_y: 0,
+        }
+    }
+}
+
+impl fmt::Write for VramTextWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            if c == '\n' {
+                self.cursor_y += 16;
+                self.cursor_x = 0;
+                continue;
+            }
+            draw_font_fg(self.vram, self.cursor_x, self.cursor_y, 0xffffff, c);
+            self.cursor_x += 8;
+        }
+        Ok(())
+    }
+}
+
+// Loaded Image Protocolの定義
+pub struct EfiLoadedImageProtocol {
+    _reserved: [u64; 8],
+    pub image_base: u64,
+    pub image_size: u64,
+}
+
+const EFI_LOADED_IMAGE_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data0: 0x5B1B31A1,
+    data1: 0x9562,
+    data2: 0x11d2,
+    data3: [0x80, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
+
+pub fn locate_loaded_image_protocol(
+    image_handle: EfiHandle,
+    efi_system_table: &EfiSystemTable,
+) -> Result<&EfiLoadedImageProtocol> {
+    let mut loaded_image_protocol = null_mut::<EfiLoadedImageProtocol>();
+    let status = (efi_system_table.boot_services().handle_protocol)(
+        image_handle,
+        &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+        &mut loaded_image_protocol as *mut *mut EfiLoadedImageProtocol as *mut *mut u8,
+    );
+    if status != EfiStatus::Success {
+        return Err("Failed to locate loaded image protocol");
+    }
+    Ok(unsafe { &*loaded_image_protocol })
 }
