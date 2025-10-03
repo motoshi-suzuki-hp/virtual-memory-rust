@@ -2,46 +2,122 @@
 #![no_main]
 #![feature(offset_of)]
 
-extern crate alloc;
-
-use alloc::vec::Vec;
+use core::fmt::Write;
 use core::panic::PanicInfo;
-use wasabi::{println, info, error};
-use wasabi::allocator::ALLOCATOR;
-use wasabi::graphics::{fill_rect, draw_test_pattern, Bitmap};
-use wasabi::qemu::{exit_qemu, QemuExitCode};
-use wasabi::uefi::{init_vram, EfiHandle, EfiSystemTable, MemoryMapHolder, exit_from_efi_boot_services};
+use core::writeln;
+use wasabi::error;
+use wasabi::graphics::draw_test_pattern;
+use wasabi::graphics::fill_rect;
+use wasabi::graphics::Bitmap;
+use wasabi::info;
+use wasabi::init::init_basic_runtime;
+use wasabi::init::init_paging;
+use wasabi::print::hexdump;
+use wasabi::println;
+use wasabi::qemu::exit_qemu;
+use wasabi::qemu::QemuExitCode;
+use wasabi::uefi::init_vram;
+use wasabi::uefi::locate_loaded_image_protocol;
+use wasabi::uefi::EfiHandle;
+use wasabi::uefi::EfiMemoryType;
+use wasabi::uefi::EfiSystemTable;
+use wasabi::uefi::VramTextWriter;
+use wasabi::warn;
+use wasabi::x86::flush_tlb;
+use wasabi::x86::hlt;
+use wasabi::x86::init_exceptions;
+use wasabi::x86::read_cr3;
+use wasabi::x86::trigger_debug_interrupt;
+use wasabi::x86::PageAttr;
 
 #[no_mangle]
 fn efi_main(image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
     println!("Booting WasabiOS...");
+    println!("image_handle: {:#018X}", image_handle);
+    println!("efi_system_table: {:#p}", efi_system_table);
 
-    // グラフィックスを初期化
+    // Loaded Image Protocolから情報取得
+    let loaded_image_protocol = locate_loaded_image_protocol(image_handle, efi_system_table)
+        .expect("Failed to get LoadedImageProtocol");
+    println!("image_base: {:#018X}", loaded_image_protocol.image_base);
+    println!("image_size: {:#018X}", loaded_image_protocol.image_size);
+
+    // ログテスト
+    info!("info");
+    warn!("warn");
+    error!("error");
+
+    // システムテーブルのhexdump
+    hexdump(efi_system_table);
+
+    // グラフィックス初期化
     let mut vram = init_vram(efi_system_table).expect("init_vram failed");
     let vw = vram.width();
     let vh = vram.height();
-    info!("VRAM initialized: {}x{}", vw, vh);
     fill_rect(&mut vram, 0x000000, 0, 0, vw, vh).expect("fill_rect failed");
     draw_test_pattern(&mut vram);
-    info!("Graphics initialized");
 
-    // メモリマップを取得してブートサービスを終了
-    let mut memory_map = MemoryMapHolder::new();
-    exit_from_efi_boot_services(image_handle, efi_system_table, &mut memory_map);
-    info!("Exited from UEFI boot services");
+    // VRAM上にテキスト出力
+    let mut w = VramTextWriter::new(&mut vram);
 
-    // アロケータを初期化
-    ALLOCATOR.init_with_mmap(&memory_map);
-    info!("Memory allocator initialized");
+    // 基本ランタイム初期化（ブートサービス終了 + アロケータ初期化）
+    let memory_map = init_basic_runtime(image_handle, efi_system_table);
 
-    // ヒープメモリのテスト
-    let mut vec = Vec::new();
-    vec.push(1);
-    vec.push(2);
-    vec.push(3);
-    info!("Vec test: {:?}", vec);
+    // メモリマップを表示
+    let mut total_memory_pages = 0;
+    for e in memory_map.iter() {
+        if e.memory_type() != EfiMemoryType::CONVENTIONAL_MEMORY {
+            continue;
+        }
+        total_memory_pages += e.number_of_pages();
+        writeln!(w, "{e:?}").unwrap();
+    }
 
-    loop {}
+    let total_memory_size_mib = total_memory_pages * 4096 / 1024 / 1024;
+    writeln!(
+        w,
+        "Total: {total_memory_pages} pages = {total_memory_size_mib} MiB"
+    )
+    .unwrap();
+    writeln!(w, "Hello, Non-UEFI world!").unwrap();
+
+    // 現在のページテーブルを確認
+    let cr3 = read_cr3();
+    println!("cr3 = {cr3:#p}");
+    let t = Some(unsafe { &*cr3 });
+    println!("{t:?}");
+    let t = t.and_then(|t| t.next_level(0));
+    println!("{t:?}");
+    let t = t.and_then(|t| t.next_level(0));
+    println!("{t:?}");
+    let t = t.and_then(|t| t.next_level(0));
+    println!("{t:?}");
+
+    // 例外ハンドラ初期化
+    let (_gdt, _idt) = init_exceptions();
+    info!("Exception initialized!");
+
+    // デバッグ割り込みのテスト
+    trigger_debug_interrupt();
+    info!("Execution continued.");
+
+    // ページング初期化
+    init_paging(&memory_map);
+    info!("Now we are using our own page tables!");
+
+    // NULLポインタ参照を検出できるようにページ0をアンマップ
+    let page_table = read_cr3();
+    unsafe {
+        (*page_table)
+            .create_mapping(0, 4096, 0, PageAttr::NotPresent)
+            .expect("Failed to unmap page 0");
+    }
+    flush_tlb();
+
+    // メインループ
+    loop {
+        hlt()
+    }
 }
 
 #[panic_handler]
